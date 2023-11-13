@@ -1,0 +1,427 @@
+---
+title: "project"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library("dplyr")
+library('tidyr') 
+library('stringi')
+library('mice')
+library('ggplot2')
+library("fuzzyjoin")
+library('lme4')
+library('lmerTest')
+library("nlme")
+library("simputation")
+library('faraway')
+library('reshape2')
+library('lattice')
+```
+
+```{r}
+consultantsWTE <- read.csv("consultantsWTE.csv")
+ongoing_waits <- read.csv("sot_performance_ongoing_waits_dec21.csv")
+specialty_ref <- read.csv("specialty-reference.csv")
+HB_region <- read.csv("HB_region.csv")
+hb14_hb19 <- read.csv("hb14_hb19.csv")
+sp_aggregates <- read.csv("speciality_aggregates.csv")
+
+HB_dem <- read.csv("HBdemography.csv")
+hb_pop <- read.csv("hb_pop_proj_03072020.csv")
+```
+
+
+```{r}
+consultantsWTE <- consultantsWTE[,-c(2,3,7,14,21)]
+ 
+agg_sp <- c("All medical specialties", "All specialties",'Clinical laboratory specialties','Medical specialties','Psychiatric specialties','Surgical specialties','Paediatrics specialties','All dental specialties')
+
+consultantsWTE <- dplyr::filter(consultantsWTE, !(consultantsWTE$Specialty %in% agg_sp))
+
+consultantsWTE <- pivot_longer(data=consultantsWTE, cols=-c(Specialty),
+                             names_to="HB", values_to="WTE")
+
+consultantsWTE$HB <- stri_replace_all_fixed(consultantsWTE$HB, pattern = c("...",".","2"), 
+                          replacement = c(" and "," ",""), vectorize_all = FALSE)
+
+```
+
+
+```{r}
+# problem here
+con1 <- regex_left_join(consultantsWTE, specialty_ref, by = c("Specialty"="SpecialtyName"),ignore_case=TRUE)
+
+con1[which(con1$Specialty.x=="Genito - urinary medicine"),4] <- "AA"
+con1[which(con1$Specialty.x=="Audio vestibular medicine"),4] <- "C51"
+con1[which(con1$Specialty.x=="General psychiatry"),4] <- "G1"
+con1[which(con1$Specialty.x=="Old age psychiatry"),4] <- "G4"
+con1[which(con1$Specialty.x=="Otolaryngology"),4] <- "C5"
+con1[which(con1$Specialty.x=="Trauma & orthopaedic surgery"),4] <- "C8"
+con1[which(con1$Specialty.x=="Oral & maxillofacial surgery"),4] <- "C13"
+con1[which(con1$Specialty.x=="Community sexual and reproductive health"),4] <- "F4"
+con1[which(con1$Specialty.x=="Acute internal medicine"),4] <- "A11"
+con1[which(con1$Specialty.x=="General (internal) medicine"),4] <- "A1"
+con1[which(con1$Specialty.x=="Emergency medicine"),4] <- "C2"
+
+
+# delete the NA with "not know medical specialty", and delete the last column
+con1 <- dplyr::filter(con1, is.na(con1$Specialty.y)==FALSE)
+con1 <- con1[,c(2,3,4)]
+
+# add the HB codes
+hb14_hb19 <- hb14_hb19[,c(1,2)]
+
+con1 <- dplyr::left_join(con1, hb14_hb19, by = c("HB"="HBName"))
+con1 <- dplyr::filter(con1, is.na(con1$HB.y)==FALSE)
+con1 <- con1[,c(2,3,4)]
+
+```
+
+
+```{r}
+ongoing_waits <- ongoing_waits[-which(ongoing_waits["PatientType"]=="New Outpatient"),]
+
+ongoing_waits <- dplyr::filter(ongoing_waits, ongoing_waits$Specialty!="Z9")
+ongoing_waits <- dplyr::filter(ongoing_waits, ongoing_waits$HBT!="S92000003")
+ongoing_waits <- ongoing_waits[,c(1,2,5,7)]
+```
+
+
+```{r}
+ongoing_waits %>% 
+  select(NumberWaiting) %>%
+  gather(na.rm=TRUE) %>%
+  ggplot(aes(x = value, y = -0.5)) +
+  #geom_boxplot() +
+  geom_density(aes(x = value, y = stat(scaled)), inherit.aes = FALSE) +
+  coord_cartesian(xlim=c(0,1000))+
+  theme(axis.title.y = element_blank(),axis.title.x = element_blank())
+```
+
+
+
+Split the date into years, months and dates, in ongoing_waits dataset
+```{r}
+date <- as.Date(as.character(ongoing_waits$MonthEnding), format = "%Y%m%d")
+lt <- unclass(as.POSIXlt(date))
+Dates <- with(lt, data.frame(Date = date, year = year + 1900, month = mon + 1, day = mday))
+ongoing_waits <- cbind(ongoing_waits,Dates)
+ongoing_waits <- ongoing_waits[,c(6,7,2,3,4)]
+```
+
+
+aggregate the months (impute first according to the specialty then aggregates?)
+```{r}
+ongoing_waits <- aggregate(NumberWaiting~year+HBT+Specialty, data=ongoing_waits, sum)
+
+# delete the rows whose specialty is empty
+ongoing_waits <- filter(ongoing_waits, ongoing_waits$Specialty!="")
+
+ongoing_waits <- dplyr::left_join(ongoing_waits, con1, by = c("HBT"="HB.y","Specialty"="Specialty.y"))
+
+ongoing_waits <- distinct(ongoing_waits)
+
+# delete the SB0801
+ongoing_waits <- dplyr::filter(ongoing_waits, ongoing_waits$HBT!="SB0801")
+```
+
+
+population data
+```{r}
+HB_dem <- HB_dem[,c(2,3,5,7)]
+HB_dem <- dplyr::filter(HB_dem, Year %in% c(2012,2013,2014,2015,2016,2017,2018,2019,2020))
+
+hb_pop <- hb_pop[,c(1,2,4,6)]
+hb_pop <- dplyr::filter(hb_pop, Year %in% 2021)
+
+HB_dem <- rbind(HB_dem,hb_pop)
+HB_dem <- dplyr::filter(HB_dem, HB!="S92000003")
+
+HB_dem <- pivot_wider(HB_dem,names_from="Sex", values_from="AllAges")
+colnames(HB_dem) <- c("Year","HB","population","F_ppl","M_ppl")
+
+ongoing_waits <- dplyr::left_join(ongoing_waits, HB_dem, by = c("year"="Year","HBT"="HB"))
+
+ongoing_waits <- ongoing_waits[,-c(7,8)]
+
+colnames(ongoing_waits)[2] <- "HB"
+```
+
+```{r}
+mean(is.na(ongoing_waits$WTE))
+```
+aggregate the specialty
+```{r}
+ongoing_waits <- aggregate(cbind(WTE,NumberWaiting) ~ HB + year + population, data=ongoing_waits, sum)
+```
+
+
+```{r}
+ongoing_waits <- dplyr::filter(ongoing_waits, ongoing_waits$HB != "S08000025")
+ongoing_waits <- dplyr::filter(ongoing_waits, ongoing_waits$HB != "S08000026")
+```
+
+
+```{r}
+# change the year to the class character
+ongoing_waits$year <- as.numeric(ongoing_waits$year)
+ongoing_waits$WTE <- round(ongoing_waits$WTE,2)
+ongoing_waits$NumberWaiting <- as.integer(ongoing_waits$NumberWaiting)
+```
+
+Data exploration
+```{r}
+summary(ongoing_waits)
+```
+
+```{r}
+ongoing_waits %>% 
+  select(WTE,NumberWaiting) %>%
+  gather(na.rm=TRUE) %>%
+  ggplot(aes(x = value, y = -0.5)) +
+  geom_boxplot() +
+  geom_density(aes(x = value, y = stat(scaled)), inherit.aes = FALSE) +
+  facet_wrap(~key, scales = 'free')+
+  theme(axis.title.y = element_blank())
+```
+
+```{r}
+ggplot(ongoing_waits, aes(y = population,x=WTE))+
+  geom_point(cex=0.5,pch=20)+
+  geom_smooth(method = "loess", size = 1,formula="y~x")
+```
+
+
+
+heatmap
+```{r}
+mt <- ongoing_waits[,c(1,5)]
+mt1 <- c()
+
+for (i in unique(mt$HB)){
+  t <- dplyr::filter(mt, mt$HB==i)
+  mt1 <- cbind(mt1,t[,2])
+}
+colnames(mt1) <- unique(mt$HB)
+
+mt2 <- cor(mt1)
+mt2[lower.tri(mt2)] <- NA
+
+
+mt2 <- melt(mt2,rm.na=TRUE)
+
+ggheatmap <- ggplot(mt2, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "dark blue", high = "dark red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 90, vjust = 1, 
+    size = 9, hjust = 1))+
+ coord_fixed()
+
+ggheatmap + 
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "top", title.hjust = 0.5))
+```
+
+
+```{r}
+ggplot(data = ongoing_waits, 
+       mapping = aes( color=HB,group=HB,
+         y = NumberWaiting, 
+         x = year))+
+    geom_jitter(aes(color=HB),alpha=1,cex=1) +
+    geom_line()
+```
+
+
+```{r}
+ggplot(data = ongoing_waits, 
+       mapping = aes(
+         y = NumberWaiting, 
+         x = reorder(HB, NumberWaiting ,median, na.rm=TRUE)))+
+    geom_boxplot() +
+    geom_jitter(aes(color='orange'),alpha=0.3,cex=1) +
+    coord_flip()+
+    theme(axis.title.y = element_blank(),legend.position="none")
+
+ggplot(data = ongoing_waits, 
+       mapping = aes(
+         y = NumberWaiting, 
+         x = reorder(year, NumberWaiting ,median, na.rm=TRUE)))+
+    geom_boxplot() +
+    geom_jitter(aes(color='orange'),alpha=0.3,cex=1) +
+    coord_flip()+
+    theme(axis.title.y = element_blank(),legend.position="none")
+```
+
+
+```{r}
+ggplot(ongoing_waits, aes(y = NumberWaiting,x=(WTE)))+
+  geom_point(cex=0.5,pch=20)+
+  geom_smooth(method = "loess", size = 1,formula='y~x')
+
+ggplot(data = ongoing_waits, 
+       mapping = aes( group=HB,
+         y = WTE, 
+         x = reorder(HB, WTE ,median, na.rm=TRUE)))+
+    geom_jitter(aes(color=HB),alpha=1,cex=1) +
+    theme(axis.title.y = element_blank(),legend.position="none")+
+    coord_flip()
+
+```
+```{r figures-side, fig.show="hold", out.width=c("33%","33%")}
+ggplot(ongoing_waits, aes(y = NumberWaiting,x=year))+
+  geom_point(cex=0.5,pch=20)+
+  ggtitle("Year VS Waits")+
+  geom_smooth(method = "loess", size = 1,formula='y~x')
+
+ggplot(ongoing_waits, aes(y = NumberWaiting,x=WTE))+
+  geom_point(cex=0.5,pch=20)+
+  ggtitle("WTE VS Waits")+
+  geom_smooth(method = "loess", size = 1,formula='y~x')
+
+ggplot(data = ongoing_waits, 
+       mapping = aes(
+         y = NumberWaiting, 
+         x = reorder(HB, NumberWaiting ,median, na.rm=TRUE)))+
+    geom_boxplot() +
+    geom_jitter(aes(color='orange'),alpha=0.3,cex=1) +
+    coord_flip()+
+    ggtitle("Waits per HB")+
+    theme(axis.title.y = element_blank(),legend.position="none")
+```
+
+
+
+
+
+
+
+```{r}
+cor(ongoing_waits[,c(3,4,5)])
+```
+
+
+
+
+```{r}
+m1 <- glm(NumberWaiting ~ WTE + year + HB, family=poisson, data=ongoing_waits)
+```
+
+```{r}
+plot(log(fitted(m1)),log((ongoing_waits$NumberWaiting-fitted(m1))^2),
+     xlab=expression(Mean (hat(mu))),ylab=expression(Variance (y-hat(mu))^2))
+abline(0,1,col='blue')
+curve(x+x^2/20, add = TRUE,col="red")
+legend(7, 20, legend=c(expression(paste('y = x')), expression(y==~x+x^2/20)),
+       col=c("blue", "red"), lty=c(1,1), cex=0.8)#,box.lty=0)
+```
+
+
+```{r}
+#summary(glmer.nb(NumberWaiting ~ (1|HB) + log(WTE) + year, data=ongoing_waits))
+summary(m1)
+```
+
+
+
+```{r}
+m2 <- glm(NumberWaiting ~ HB + WTE + year, family=negative.binomial(32.2), data=ongoing_waits)
+summary(m2)
+```
+
+```{r}
+m3 <- glmer(NumberWaiting ~ log(WTE) + year +(1|HB), #nAGQ=2,
+                data=ongoing_waits ,family=negative.binomial(32.2))
+
+summary(m3)
+```
+
+
+```{r}
+sumary(m3)
+```
+
+
+```{r}
+qqnorm(residuals(m3),main="")
+plot(fitted(m3),residuals(m3),xlab="Fitted",ylab="Residuals")
+abline(h=0)
+```
+
+
+```{r}
+dotplot(ranef(m3,condVar=TRUE))$HB
+```
+```{r}
+table.d <- data.frame("(intercept)"=c(-251.58, 3.67),
+                      "WTE"=c(0.57, 0.09),
+                      "year"=c(0.13, 0.00),
+                      "HB"=c("-",0.41))
+
+rownames(table.d) <- c("Coeffitients", "std.error")
+
+
+knitr::kable(table.d,
+             align="c",format = "pipe",padding=2)
+```
+
+
+
+
+
+
+
+```{r}
+y.hat <- predict(m3, ongoing_waits,type="response")
+y.hat
+```
+```{r}
+ongoing_waits$NumberWaiting
+```
+
+
+
+```{r}
+plot(x=ongoing_waits$NumberWaiting,y=y.hat)
+abline(a=0,b=1)
+```
+
+```{r}
+sqrt(mean((ongoing_waits$NumberWaiting - y.hat)^2))
+```
+```{r}
+coef(m3)$HB
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
